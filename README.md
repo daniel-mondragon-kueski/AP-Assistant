@@ -112,6 +112,16 @@ puede sobrescribir desde la propia UI (se guarda en `localStorage`). El dominio 
 que se sirve la app debe estar autorizado en la consola de Firebase para que el popup de
 Google funcione.
 
+## Integración continua
+
+`.github/workflows/ci.yml` corre en cada push a `main` y en cada pull request:
+`npm ci`, `npm run lint`, `npm test`, `npm run build` y un **smoke test del
+servidor de producción** (arranca `dist/server.cjs`, verifica que
+`/api/health` responda con la forma esperada y que el frontend compilado se
+sirva). Ese último paso existe porque lint, test y build pasaron una vez
+mientras el servidor de producción estaba roto, así que compilar no es
+evidencia de que arranque. No requiere `GEMINI_API_KEY`.
+
 ## Claude Code
 
 `.claude/hooks/session-start.sh` se ejecuta al abrir una sesión de Claude Code en la web:
