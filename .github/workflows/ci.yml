@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push supersedes an in-flight run for the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Lint, test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # npm ci for a reproducible install from package-lock.json.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # Lint, test and build all passed once while the production server was
+      # still broken (import.meta in a CJS bundle), so CI also boots the built
+      # server and checks it answers. No GEMINI_API_KEY is needed: /api/health
+      # reports the key as absent and still returns status "ok".
+      - name: Smoke-test the production server
+        run: |
+          set -euo pipefail
+
+          # The server's output goes to a file, never to this step's stdout:
+          # a background process holding the step's pipe can hang the job even
+          # after the script finishes. The log is printed explicitly below.
+          NODE_ENV=production npm start > server.log 2>&1 &
+          server_pid=$!
+          # `npm start` spawns node as a child, so clean up both. Note this
+          # kills the children by PID and never the process group: the script's
+          # own shell shares that group, so a group kill would terminate this
+          # step with SIGTERM (exit 143) even after every check passed.
+          trap 'pkill -P "$server_pid" 2>/dev/null || true; kill "$server_pid" 2>/dev/null || true' EXIT
+
+          fail() {
+            echo "$1" >&2
+            echo "--- Log del servidor ---" >&2
+            cat server.log >&2 || true
+            exit 1
+          }
+
+          # -fs (not -fsS): a connection refused while the server is still
+          # booting is expected, and curl's own error would be misleading noise
+          # in the log. The explicit messages below cover real failures.
+          for attempt in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:3000/api/health -o health.json; then
+              break
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              fail "El servidor terminó antes de responder."
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              fail "El servidor no respondió tras 30 intentos."
+            fi
+            sleep 1
+          done
+
+          echo "--- Log del servidor ---"
+          cat server.log
+          echo "Respuesta de /api/health:"
+          cat health.json
+          echo
+
+          # Fails the job if the payload is not the expected shape.
+          node -e '
+            const health = require("./health.json");
+            if (health.status !== "ok") {
+              throw new Error(`status inesperado: ${JSON.stringify(health.status)}`);
+            }
+            if (typeof health.model !== "string" || !health.model) {
+              throw new Error("falta el modelo en /api/health");
+            }
+            if (typeof health.geminiConfigured !== "boolean") {
+              throw new Error("geminiConfigured debe ser booleano");
+            }
+            console.log(`Servidor de producción OK (modelo: ${health.model}).`);
+          '
+
+          # The SPA itself must be served from dist/, not just the API.
+          curl -fs http://127.0.0.1:3000/ | grep -q '<div id="root">'
+          echo "El frontend compilado se sirve correctamente."
