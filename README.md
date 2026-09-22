@@ -169,6 +169,73 @@ enteros (`@kueski.com`), separados por coma.
 `/api/health` queda deliberadamente abierto: no expone secretos, el smoke test
 de CI lo consulta y la UI lee de ahí el nombre del modelo.
 
+### Hacer que el inicio de sesión con Google funcione
+
+El login con Google **solo funciona desde un dominio registrado** en el
+proyecto. Desde cualquier otro (una demo servida en otro host, un preview, un
+iframe) Firebase lo rechaza, normalmente con `auth/internal-error`, que no dice
+cuál es la causa real.
+
+El código intenta dos flujos, y cada uno exige el dominio en un lugar distinto:
+
+| Flujo | Dónde se registra el dominio |
+| --- | --- |
+| Popup de Firebase (`signInWithPopup`) — el principal | Firebase Console → Authentication → Settings → **Authorized domains** |
+| Google Identity Services (`initTokenClient`) — el respaldo | Cloud Console → APIs & Services → Credentials → el cliente OAuth → **Authorized JavaScript origins** |
+
+#### El atajo: Firebase Hosting
+
+Firebase Auth **ya autoriza por defecto** los dominios
+`<PROJECT_ID>.web.app` y `<PROJECT_ID>.firebaseapp.com`, y Firebase Hosting es
+gratuito y **no requiere cuenta de facturación** (a diferencia de Cloud Run).
+Publicar ahí el frontend es la forma más corta de tener el login funcionando.
+
+Este repositorio ya trae `firebase.json` y `.firebaserc` apuntando al proyecto.
+Desde [Cloud Shell](https://shell.cloud.google.com), que no requiere instalar
+nada:
+
+```bash
+git clone https://github.com/daniel-mondragon-kueski/AP-Assistant
+cd AP-Assistant
+npm install
+npm run build
+npx -y firebase-tools deploy --only hosting
+```
+
+Queda en `https://gen-lang-client-0316877366.web.app`.
+
+> `firebase.json` **no** define `rewrites` a propósito. La app no usa router de
+> cliente, así que no los necesita, y un catch-all haría que `/api/*` devolviera
+> `index.html` con HTTP 200 en lugar de un 404 limpio — la UI reportaría
+> "la respuesta no es JSON válido" en vez de un error claro.
+
+#### Los dos pasos que siguen siendo obligatorios
+
+1. **Añadir el origen a los orígenes de JavaScript del cliente OAuth**, para
+   que el flujo de respaldo también funcione:
+   Cloud Console → APIs & Services → Credentials → el cliente OAuth →
+   *Authorized JavaScript origins* → `https://gen-lang-client-0316877366.web.app`
+
+2. **Añadirte como test user.** Los scopes `gmail.readonly` y `gmail.compose`
+   son *restringidos* por Google: una app en modo Testing solo permite entrar a
+   los usuarios listados, y sin esto el login falla con "Access blocked".
+   Cloud Console → APIs & Services → OAuth consent screen → *Test users*.
+
+#### Qué funciona tras esto, y qué no
+
+| | Firebase Hosting (estático) | Cloud Run (completo) |
+| --- | --- | --- |
+| Login con Google | ✅ | ✅ |
+| Leer tus correos reales de Gmail | ✅ (es código de navegador) | ✅ |
+| Auditoría del Excel | ✅ | ✅ |
+| Clasificar correos con IA, chat, redacción | ❌ requiere el backend | ✅ |
+| Requiere facturación | No | Sí |
+
+El radar no se llena solo con el hosting estático: extraer las órdenes de los
+correos pasa por `/api/analyze-emails`, que necesita el servidor. Firebase
+Hosting sirve para validar el login y el consentimiento de OAuth sin depender
+de la facturación; el producto completo vive en Cloud Run.
+
 ### Preparación en GCP (una sola vez)
 
 Hay un script idempotente que hace todo el trabajo:
