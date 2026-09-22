@@ -9,6 +9,13 @@ import { PaymentOrder, EmailFilterCriteria, DraftTemplateConfig, DuplicateAlert 
 import { ProposalAuditor } from './components/ProposalAuditor';
 import { DEFAULT_TEMPLATES } from './utils/draftTemplates';
 import { detectDuplicates } from './utils/paymentMatcher';
+import { parseStoredOrders } from './schemas/orders';
+import {
+  storedCriteriaSchema,
+  parseStoredTemplates,
+  readValidated,
+  stripUndefined,
+} from './schemas/storage';
 import { SAMPLE_ORDERS } from './data/sampleOrders';
 import {
   getCachedToken,
@@ -20,7 +27,7 @@ import {
   FetchEmailsResult,
 } from './services/gmail';
 import { googleSignIn, logout, initAuth } from './services/firebaseAuth';
-import { readApiError } from './services/api';
+import { postAnalyzeEmails } from './services/api';
 import type { User } from 'firebase/auth';
 import firebaseConfig from '../firebase-applet-config.json';
 import {
@@ -88,38 +95,53 @@ export default function App() {
 
   // Criteria with local storage persistence
   const [criteria, setCriteria] = useState<EmailFilterCriteria>(() => {
-    const saved = localStorage.getItem('ap_filter_criteria');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        return {
-          ...defaultCleanCriteria,
-          ...parsed,
-          onlyInbox: true, // Always enforce Inbox only and exclude drafts
-          // Always ensure zero unwanted exclusions when restarting
-          excludeKeywords: (parsed.excludeKeywords || []).filter((k: string) => k.toLowerCase() !== 'marketing'),
-        };
-      } catch {}
-    }
-    return defaultCleanCriteria;
+    // Validated on read: stored criteria may come from an older build or have
+    // been hand-edited, and a wrong-shaped value here breaks the scan silently.
+    const saved = readValidated('ap_filter_criteria', storedCriteriaSchema);
+    if (!saved) return defaultCleanCriteria;
+
+    return {
+      ...defaultCleanCriteria,
+      // stripUndefined keeps absent stored fields from clobbering the defaults.
+      ...stripUndefined(saved),
+      onlyInbox: true, // Always enforce Inbox only and exclude drafts
+      // Always ensure zero unwanted exclusions when restarting
+      excludeKeywords: (saved.excludeKeywords || []).filter((k) => k.toLowerCase() !== 'marketing'),
+    };
   });
 
   // Orders State
   const [orders, setOrders] = useState<PaymentOrder[]>(() => {
-    const saved = localStorage.getItem('ap_saved_orders');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          // If orders lack area or new template subjects, refresh sample dataset
-          const hasOldData = parsed.some(p => p.orderNumber === 'OC-2024-8891' || p.orderNumber === 'PO-9942');
-          if (!hasOldData) return parsed;
-        }
-      } catch {
-        // fallback
-      }
+    let raw: string | null = null;
+    try {
+      raw = localStorage.getItem('ap_saved_orders');
+    } catch {
+      raw = null;
     }
-    return SAMPLE_ORDERS;
+    if (!raw) return SAMPLE_ORDERS;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return SAMPLE_ORDERS;
+    }
+
+    // Records that no longer satisfy the schema are dropped individually, so a
+    // single corrupt entry does not cost the user their whole saved radar.
+    const validated = parseStoredOrders(parsed);
+    if (!validated || validated.orders.length === 0) return SAMPLE_ORDERS;
+    if (validated.discarded > 0) {
+      console.warn(
+        `ap_saved_orders: ${validated.discarded} orden(es) guardada(s) descartada(s) por formato inválido.`
+      );
+    }
+
+    // If orders predate the current template subjects, refresh sample dataset
+    const hasOldData = validated.orders.some(
+      (o) => o.orderNumber === 'OC-2024-8891' || o.orderNumber === 'PO-9942'
+    );
+    return hasOldData ? SAMPLE_ORDERS : validated.orders;
   });
 
   const [isScanning, setIsScanning] = useState(false);
@@ -143,20 +165,29 @@ export default function App() {
 
   // Templates
   const [templates, setTemplates] = useState<DraftTemplateConfig[]>(() => {
-    const savedTpls = localStorage.getItem('ap_draft_templates');
-    if (savedTpls) {
-      try {
-        const parsed = JSON.parse(savedTpls);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          // Check if it's the old version without SC/OC or with old subject
-          const hasOldSubject = parsed.some(p => p.subjectTemplate?.includes('Autorización y Pago Inmediato'));
-          if (!hasOldSubject) return parsed;
-        }
-      } catch {
-        // fallback
-      }
+    let raw: string | null = null;
+    try {
+      raw = localStorage.getItem('ap_draft_templates');
+    } catch {
+      raw = null;
     }
-    return DEFAULT_TEMPLATES;
+    if (!raw) return DEFAULT_TEMPLATES;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return DEFAULT_TEMPLATES;
+    }
+
+    const validated = parseStoredTemplates(parsed);
+    if (!validated) return DEFAULT_TEMPLATES;
+
+    // Check if it's the old version without SC/OC or with old subject
+    const hasOldSubject = validated.some((t) =>
+      t.subjectTemplate.includes('Autorización y Pago Inmediato')
+    );
+    return hasOldSubject ? DEFAULT_TEMPLATES : validated;
   });
 
   // Active Draft Modal
@@ -305,33 +336,24 @@ export default function App() {
       );
 
       // 2. Call server backend endpoint with Gemini using two-level filtration
-      const response = await fetch('/api/analyze-emails', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          emails: fetched,
-          templates,
-          filterOptions: {
-            filterMode: criteria.filterMode || 'hybrid',
-            templateTolerance: criteria.templateTolerance || 'flexible',
-            minTemplateScore: criteria.minTemplateScore || 65,
-            secondaryFilter: criteria.secondaryFilter || {
-              enabled: true,
-              includePaymentDates: true,
-              includeDispersions: true,
-              includeSpecificRequests: true,
-              customKeywords: [],
-            },
+      const data = await postAnalyzeEmails({
+        emails: fetched,
+        templates,
+        filterOptions: {
+          filterMode: criteria.filterMode || 'hybrid',
+          templateTolerance: criteria.templateTolerance || 'flexible',
+          minTemplateScore: criteria.minTemplateScore || 65,
+          secondaryFilter: criteria.secondaryFilter || {
+            enabled: true,
+            includePaymentDates: true,
+            includeDispersions: true,
+            includeSpecificRequests: true,
+            customKeywords: [],
           },
-        }),
+        },
       });
 
-      if (!response.ok) {
-        throw await readApiError(response, 'Error en el servidor al analizar correos');
-      }
-
-      const data = await response.json();
-      const detectedOrders: PaymentOrder[] = (data.orders || []).map((o: any, idx: number) => {
+      const detectedOrders: PaymentOrder[] = data.orders.map((o, idx) => {
         // Match with original Gmail message metadata for exact deep linking
         const matchedEmail = fetched.find(
           (e) =>
@@ -341,7 +363,9 @@ export default function App() {
         ) || fetched[0];
 
         const realEmailId = (matchedEmail && matchedEmail.id) || o.emailId || '';
-        const realThreadId = (matchedEmail && matchedEmail.threadId) || o.threadId || realEmailId;
+        // Gemini's response schema carries no threadId, so the Gmail message
+        // metadata is the only source for it.
+        const realThreadId = (matchedEmail && matchedEmail.threadId) || realEmailId;
         const realSubject = (matchedEmail && matchedEmail.subject) || o.emailSubject || '';
         const realSender = (matchedEmail && matchedEmail.sender) || o.emailSender || '';
         const realDate = (matchedEmail && matchedEmail.date) || o.emailDate || new Date().toLocaleDateString();
@@ -415,18 +439,36 @@ export default function App() {
         marianaExtractedCount,
       });
 
+      // Surface what validation rejected or flagged. A dropped order is a
+      // payment the user would otherwise never learn about, so it is reported
+      // rather than logged and forgotten.
+      const dataIssues: string[] = [];
+      if (data.skipped.length > 0) {
+        dataIssues.push(
+          `${data.skipped.length} extracción(es) descartada(s) por datos incompletos`
+        );
+      }
+      if (data.warnings.length > 0) {
+        dataIssues.push(`${data.warnings.length} con monto ilegible (revisa el correo original)`);
+      }
+      const issuesSuffix = dataIssues.length ? ` ⚠️ ${dataIssues.join('; ')}.` : '';
+
       if (marianaFound && marianaExtractedCount > 0) {
         setScanStatusMessage(
-          `¡Éxito! Se detectó el correo de Mariana Herrera y se extrajeron ${marianaExtractedCount} órdenes de compra al Radar.`
+          `¡Éxito! Se detectó el correo de Mariana Herrera y se extrajeron ${marianaExtractedCount} órdenes de compra al Radar.${issuesSuffix}`
         );
       } else if (marianaFound && marianaExtractedCount === 0) {
         setScanStatusMessage(
-          `Se encontró el correo de Mariana en Gmail, pero las órdenes están siendo procesadas.`
+          `Se encontró el correo de Mariana en Gmail, pero las órdenes están siendo procesadas.${issuesSuffix}`
         );
       } else {
         setScanStatusMessage(
-          `Escaneo completo: ${fetched.length} correos analizados, ${detectedOrders.length} compromisos de pago en el Radar.`
+          `Escaneo completo: ${fetched.length} correos analizados, ${detectedOrders.length} compromisos de pago en el Radar.${issuesSuffix}`
         );
+      }
+
+      if (data.warnings.length > 0) {
+        console.warn('Órdenes con monto ilegible:', data.warnings);
       }
     } catch (err: any) {
       console.error('Error durante el escaneo:', err);

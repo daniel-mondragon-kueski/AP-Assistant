@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { PaymentOrder, DraftTemplateConfig } from '../types';
 import { DEFAULT_TEMPLATES, fillTemplate } from '../utils/draftTemplates';
 import { createGmailDraft, generateGmailComposeUrl } from '../services/gmail';
-import { readApiError } from '../services/api';
+import { postGenerateDraft } from '../services/api';
 import {
   X,
   Send,
@@ -113,10 +113,7 @@ export const DraftModal: React.FC<DraftModalProps> = ({
     setIsAiGenerating(true);
     setStatusMessage(null);
     try {
-      const res = await fetch('/api/generate-draft-content', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const data = await postGenerateDraft({
           type: draftType,
           orderNumber,
           supplierName,
@@ -126,19 +123,11 @@ export const DraftModal: React.FC<DraftModalProps> = ({
           bankDetails,
           reason: justification,
           notes: additionalNotes,
-        }),
       });
 
-      if (!res.ok) {
-        throw await readApiError(res, 'Error al conectar con el asistente de IA');
-      }
-
-      const data = await res.json();
-      if (data.subject && data.bodyText) {
-        setGeneratedSubject(data.subject);
-        setGeneratedBody(data.bodyText);
-        setStatusMessage({ type: 'success', text: 'Borrador optimizado con IA exitosamente.' });
-      }
+      setGeneratedSubject(data.subject);
+      setGeneratedBody(data.bodyText);
+      setStatusMessage({ type: 'success', text: 'Borrador optimizado con IA exitosamente.' });
     } catch (err: any) {
       setStatusMessage({ type: 'error', text: err.message || 'No se pudo optimizar con IA' });
     } finally {

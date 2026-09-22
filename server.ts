@@ -2,6 +2,14 @@ import express from "express";
 import path from "path";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { ZodError, type ZodType } from "zod";
+
+import {
+  analyzeEmailsRequestSchema,
+  auditChatRequestSchema,
+  generateDraftRequestSchema,
+} from "./src/schemas/api";
+import { validateGeminiOrders } from "./src/schemas/orders";
 
 // Load .env.local first (local overrides, git-ignored) then .env.
 dotenv.config({ path: ".env.local" });
@@ -46,7 +54,22 @@ function sendError(res: express.Response, error: any, fallbackMessage: string) {
   if (error instanceof MissingApiKeyError) {
     return res.status(503).json({ error: error.message, code: "MISSING_API_KEY" });
   }
+  if (error instanceof ZodError) {
+    return res.status(400).json({
+      error: "El cuerpo de la petición no tiene el formato esperado.",
+      code: "INVALID_REQUEST",
+      issues: error.issues.map((issue) => ({
+        path: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+  }
   return res.status(500).json({ error: error?.message || fallbackMessage });
+}
+
+/** Validates a request body, throwing a ZodError that sendError turns into a 400. */
+function parseBody<T>(schema: ZodType<T>, body: unknown): T {
+  return schema.parse(body ?? {});
 }
 
 // Health / configuration probe used by the UI and for local diagnostics.
@@ -61,9 +84,12 @@ app.get("/api/health", (_req, res) => {
 // 1. Analyze batch of emails with Gemini for PO, Template Match & Secondary Filtering
 app.post("/api/analyze-emails", async (req, res) => {
   try {
-    const { emails, templates, filterOptions } = req.body;
-    if (!emails || !Array.isArray(emails) || emails.length === 0) {
-      return res.json({ orders: [] });
+    const { emails, templates, filterOptions } = parseBody(
+      analyzeEmailsRequestSchema,
+      req.body
+    );
+    if (emails.length === 0) {
+      return res.json({ orders: [], skipped: [], warnings: [] });
     }
 
     const ai = getGemini();
@@ -301,7 +327,18 @@ Extrae rigurosamente para cada correo que califique en el radar:
     });
 
     const parsed = JSON.parse(response.text || "{}");
-    return res.json({ orders: parsed.orders || [] });
+    const { orders, skipped, warnings } = validateGeminiOrders(parsed.orders);
+
+    // Report rather than hide: a dropped order in an AP radar is a payment
+    // nobody sees again, so the client surfaces these counts to the user.
+    if (skipped.length || warnings.length) {
+      console.warn(
+        `analyze-emails: ${skipped.length} orden(es) descartada(s), ${warnings.length} con datos incompletos.`,
+        { skipped, warnings }
+      );
+    }
+
+    return res.json({ orders, skipped, warnings });
   } catch (error: any) {
     console.error("Error analyzing emails:", error);
     return sendError(res, error, "Failed to analyze emails");
@@ -311,7 +348,8 @@ Extrae rigurosamente para cada correo que califique en el radar:
 // 2. Draft generator assistant / customizer
 app.post("/api/generate-draft-content", async (req, res) => {
   try {
-    const { type, orderNumber, supplierName, amount, currency, dueDate, bankDetails, reason, notes } = req.body;
+    const { type, orderNumber, supplierName, amount, currency, dueDate, bankDetails, reason, notes } =
+      parseBody(generateDraftRequestSchema, req.body);
     const ai = getGemini();
 
     const prompt = `Actúa como un analista senior de Cuentas por Pagar (AP) y Finanzas.
@@ -358,7 +396,10 @@ Devuelve un JSON con:
 // 3. Interactive AP & Proposal Audit Chat Assistant
 app.post("/api/audit-chat", async (req, res) => {
   try {
-    const { messages, radarOrders, analysisResult } = req.body;
+    const { messages, radarOrders, analysisResult } = parseBody(
+      auditChatRequestSchema,
+      req.body
+    );
     const ai = getGemini();
 
     const systemPrompt = `Eres el Asistente Experto de Cuentas por Pagar (AP) y Operaciones Financieras de Kueski.
@@ -397,23 +438,23 @@ ${
           fileName: analysisResult.fileName,
           targetFullDateLabel: analysisResult.targetFullDateLabel,
           totals: analysisResult.totals,
-          sheetsSummary: Object.keys(analysisResult.sheets || {}).map((k) => ({
-            sheet: k,
-            displayName: analysisResult.sheets[k].displayName,
-            total: analysisResult.sheets[k].total,
-            itemsCount: analysisResult.sheets[k].items?.length,
+          sheetsSummary: Object.entries(analysisResult.sheets ?? {}).map(([sheet, data]) => ({
+            sheet,
+            displayName: data.displayName,
+            total: data.total,
+            itemsCount: data.items.length,
           })),
-          criticalMissingCount: analysisResult.criticalMissing?.length,
-          criticalMissingItems: (analysisResult.criticalMissing || []).map((m: any) => ({
+          criticalMissingCount: analysisResult.criticalMissing.length,
+          criticalMissingItems: analysisResult.criticalMissing.map((m) => ({
             orderNumber: m.radarItem?.orderNumber,
             supplierName: m.radarItem?.supplierName,
             amount: m.radarItem?.amount,
             isUrgent: m.isUrgent,
             reason: m.reason,
           })),
-          anomaliesCount: analysisResult.anomalies?.length,
+          anomaliesCount: analysisResult.anomalies.length,
           anomalies: analysisResult.anomalies,
-          matchesCount: analysisResult.matches?.length,
+          matchesCount: analysisResult.matches.length,
         },
         null,
         2

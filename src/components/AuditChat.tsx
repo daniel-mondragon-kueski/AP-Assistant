@@ -24,7 +24,7 @@ import {
   AuditChatMessage,
 } from '../types';
 import { formatCurrencyMXN } from '../services/excelParser';
-import { fetchBackendHealth, formatModelLabel, readApiError } from '../services/api';
+import { fetchBackendHealth, formatModelLabel, postAuditChat } from '../services/api';
 
 interface AuditChatProps {
   radarOrders: PaymentOrder[];
@@ -205,11 +205,8 @@ ${
     setIsLoading(true);
 
     try {
-      // Call server audit-chat API
-      const res = await fetch('/api/audit-chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      // Call server audit-chat API (response shape validated in the helper)
+      const data = await postAuditChat({
           messages: newMessages.map((m) => ({
             role: m.sender,
             content: m.text,
@@ -227,15 +224,8 @@ ${
                 formattedApprovalEmail: analysisResult.formattedApprovalEmail,
               }
             : null,
-        }),
       });
-
-      if (!res.ok) {
-        throw await readApiError(res, 'Error al consultar el asistente');
-      }
-
-      const data = await res.json();
-      const botReply = data.reply || 'No pude obtener una respuesta. Por favor intenta de nuevo.';
+      const botReply = data.reply;
 
       setMessages((prev) => [
         ...prev,

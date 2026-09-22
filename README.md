@@ -17,6 +17,34 @@ Agente de IA para operaciones de Cuentas por Pagar en Kueski:
 | `src/services/gmail.ts` | Cliente de la API de Gmail (lectura de correos y creación de borradores). |
 | `src/services/firebaseAuth.ts` | Login con Google vía Firebase Auth para obtener el token de Gmail. |
 | `src/utils/paymentMatcher.ts` | Detección de duplicados y estado de vencimiento. |
+| `src/schemas/` | Validación con Zod en las fronteras de datos externos (ver abajo). |
+
+## Validación de datos externos
+
+`strict` de TypeScript solo cubre lo que el compilador puede ver. Los datos que
+entran en runtime —respuestas de Gemini, cuerpos HTTP y `localStorage`— se
+validan con Zod en `src/schemas/`:
+
+| Frontera | Esquema | Comportamiento ante datos inválidos |
+| --- | --- | --- |
+| Respuestas de Gemini (`orders`) | `orders.ts` | Valida orden por orden. Las inservibles se **reportan** (`skipped`) y las que perdieron el monto se marcan (`warnings`); la UI muestra los conteos. Una orden desaparecida en un radar de pagos es un pago que nadie vuelve a ver. |
+| Cuerpos de petición | `api.ts` | **400** con el campo y el motivo. Un correo malformado dentro del lote se descarta sin tumbar el escaneo completo. |
+| Respuestas de la API en el navegador | `api.ts` | Error explícito antes de llegar al estado de React: HTTP 200 no garantiza la forma del cuerpo. |
+| `localStorage` | `storage.ts` | Degrada a los valores por omisión. Los registros corruptos se descartan de forma individual para no perder el radar guardado completo. |
+
+Detalles que valen la pena conocer:
+
+- **`parseMonetaryValue`** desambigua el formato latino (`$2.689,95`) del
+  estadounidense (`$2,689.95`) en lugar de asumir uno: el separador más a la
+  derecha es el decimal. Un separador único seguido de exactamente 3 dígitos se
+  trata como agrupación, porque una divisa lleva máximo 2 decimales
+  (`2.689` → `2689`). Nunca devuelve `NaN`.
+- Los montos **negativos pasan**, porque el auditor los reporta como anomalías;
+  rechazarlos ahí escondería justo las filas que debe señalar.
+- Las **filas del Excel no se validan con Zod** a propósito. El objetivo del
+  auditor es *reportar* hojas sucias (montos negativos, celdas vacías), así que
+  rechazar el archivo sería lo contrario de lo que se necesita; esa
+  normalización vive en `excelParser.ts`.
 
 ### Endpoints del backend
 
@@ -64,7 +92,7 @@ Se leen de `.env.local` (prioridad) y luego de `.env`. Ambos están en `.gitigno
 | --- | --- |
 | `npm run dev` | Servidor Express + Vite con HMR en `http://localhost:3000`. |
 | `npm run lint` | Chequeo de tipos con `tsc --noEmit`. |
-| `npm test` | Pruebas de humo de la lógica pura (`node:test` vía `tsx`). |
+| `npm test` | 60 pruebas de la lógica pura y de los esquemas de validación (`node:test` vía `tsx`). |
 | `npm run build` | Compila el frontend a `dist/` y el servidor a `dist/server.cjs`. |
 | `npm start` | Ejecuta el build de producción (usar con `NODE_ENV=production`). |
 | `npm run clean` | Borra artefactos de build. |
