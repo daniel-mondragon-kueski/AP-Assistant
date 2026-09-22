@@ -1,0 +1,6 @@
+{
+  "name": "Asistente de Operaciones Financieras y Cuentas por Pagar (AP)",
+  "description": "Agente de IA especializado en finanzas y cuentas por pagar (AP) para monitorear solicitudes de pago en Gmail, estructurar el Radar de Pagos Pendientes, auditar y cruzar autónomamente con archivos Excel de Propuestas de Pago semanales (SOFOM, INC, TECH), detectar faltantes críticos y duplicidades, y redactar el correo formal de aprobación con cálculo de totales.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
