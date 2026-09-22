@@ -1,0 +1,124 @@
+name: Deploy to Cloud Run
+
+# Manual only, on purpose. There is no staging environment, so every deploy
+# goes straight to whoever is using the tool. To deploy automatically on every
+# merge instead, add:
+#
+#   push:
+#     branches: [main]
+#
+# alongside workflow_dispatch below.
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: Cloud Run service name
+        required: false
+        default: ap-assistant
+      region:
+        description: Cloud Run region
+        required: false
+        default: us-central1
+
+permissions:
+  contents: read
+  # Required for keyless auth via Workload Identity Federation.
+  id-token: write
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      SERVICE: ${{ inputs.service || 'ap-assistant' }}
+      REGION: ${{ inputs.region || 'us-central1' }}
+      REPOSITORY: ap-assistant
+
+    steps:
+      # Fails early with instructions instead of part-way through gcloud.
+      - name: Check required secrets and variables
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}" ] || missing+=("secret GCP_WORKLOAD_IDENTITY_PROVIDER")
+          [ -n "${{ secrets.GCP_SERVICE_ACCOUNT }}" ] || missing+=("secret GCP_SERVICE_ACCOUNT")
+          [ -n "${{ vars.GCP_PROJECT_ID }}" ] || missing+=("variable GCP_PROJECT_ID")
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "Faltan datos de configuración para desplegar:" >&2
+            for item in "${missing[@]}"; do echo "  - $item" >&2; done
+            echo "" >&2
+            echo "Configúralos en Settings > Secrets and variables > Actions." >&2
+            echo "Los pasos de preparación en GCP están en README.md, sección Despliegue." >&2
+            exit 1
+          fi
+          echo "Configuración presente."
+
+      - uses: actions/checkout@v4
+
+      # Keyless: no long-lived service-account JSON key is stored in GitHub.
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build and push the image
+        run: |
+          set -euo pipefail
+          IMAGE="${REGION}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${REPOSITORY}/${SERVICE}"
+          # Tagged with the commit SHA so a deploy is traceable and revertible,
+          # plus a moving `latest` for convenience.
+          docker build -t "${IMAGE}:${GITHUB_SHA}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          docker push "${IMAGE}:latest"
+          echo "IMAGE=${IMAGE}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+      - name: Deploy to Cloud Run
+        run: |
+          set -euo pipefail
+
+          # GEMINI_API_KEY comes from Secret Manager, never from a plain env
+          # var or the image, so the key is not readable in the Cloud Run
+          # console or in the build logs.
+          gcloud run deploy "${SERVICE}" \
+            --image "${IMAGE}" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${REGION}" \
+            --platform managed \
+            --port 8080 \
+            --set-secrets "GEMINI_API_KEY=gemini-api-key:latest" \
+            --set-env-vars "GEMINI_MODEL=${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}" \
+            --memory 512Mi \
+            --cpu 1 \
+            --min-instances 0 \
+            --max-instances 4 \
+            --no-allow-unauthenticated \
+            --quiet
+
+      - name: Report the service URL
+        run: |
+          set -euo pipefail
+          url=$(gcloud run services describe "${SERVICE}" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${REGION}" \
+            --format 'value(status.url)')
+          echo "Servicio desplegado en: ${url}"
+          {
+            echo "### Despliegue completado"
+            echo ""
+            echo "- **Servicio:** \`${SERVICE}\` (${REGION})"
+            echo "- **URL:** ${url}"
+            echo "- **Commit:** \`${GITHUB_SHA}\`"
+            echo ""
+            echo "Recuerda añadir el dominio de esa URL a los dominios autorizados"
+            echo "de Firebase Auth y a los orígenes de JavaScript del cliente OAuth,"
+            echo "o el inicio de sesión con Google fallará."
+          } >> "$GITHUB_STEP_SUMMARY"

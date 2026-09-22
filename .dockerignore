@@ -1,0 +1,23 @@
+# Keep the build context small and never bake secrets or local state into an image.
+node_modules
+dist
+build
+coverage
+
+.git
+.gitignore
+.github
+.claude
+
+# Secrets: the API key reaches Cloud Run through Secret Manager, never the image.
+.env
+.env.*
+!.env.example
+
+*.log
+health.json
+server.log
+
+.DS_Store
+*.png
+README.md
