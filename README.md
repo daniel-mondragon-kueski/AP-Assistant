@@ -112,6 +112,77 @@ puede sobrescribir desde la propia UI (se guarda en `localStorage`). El dominio 
 que se sirve la app debe estar autorizado en la consola de Firebase para que el popup de
 Google funcione.
 
+## Despliegue (Cloud Run)
+
+El `Dockerfile` es multi-stage: el stage de build compila con Vite y esbuild, y
+el de runtime solo lleva Node, las dependencias de producción y `dist/`. Corre
+como usuario sin privilegios y escucha en `$PORT` (Cloud Run inyecta `8080`).
+
+Para probar la imagen en local:
+
+```bash
+docker build -t ap-assistant .
+docker run --rm -p 8080:8080 -e GEMINI_API_KEY=tu_clave ap-assistant
+```
+
+El despliegue lo hace `.github/workflows/deploy.yml`, **manual** desde la
+pestaña Actions (`Run workflow`). Es manual a propósito: no hay entorno de
+staging, así que cada despliegue va directo a quien use la herramienta. Para
+desplegar en cada merge a `main`, el propio archivo indica qué añadir.
+
+### Preparación en GCP (una sola vez)
+
+Con `PROJECT_ID` y `REGION` (por ejemplo `us-central1`):
+
+```bash
+# 1. APIs necesarias
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
+  secretmanager.googleapis.com iamcredentials.googleapis.com --project PROJECT_ID
+
+# 2. Repositorio de imágenes
+gcloud artifacts repositories create ap-assistant \
+  --repository-format=docker --location=REGION --project PROJECT_ID
+
+# 3. La clave de Gemini como secreto (no como variable de entorno)
+printf 'TU_CLAVE' | gcloud secrets create gemini-api-key \
+  --data-file=- --project PROJECT_ID
+```
+
+Después hace falta una **cuenta de servicio** con los roles `run.admin`,
+`artifactregistry.writer`, `iam.serviceAccountUser` y acceso de lectura al
+secreto (`secretmanager.secretAccessor`), y un **Workload Identity Provider**
+que permita a este repositorio suplantarla. Ese mecanismo evita guardar una
+llave JSON de larga duración en GitHub; los pasos están en la
+[documentación de google-github-actions/auth](https://github.com/google-github-actions/auth#workload-identity-federation).
+
+### Configuración en GitHub
+
+En *Settings > Secrets and variables > Actions*:
+
+| Nombre | Tipo | Valor |
+| --- | --- | --- |
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | Secret | `projects/…/locations/global/workloadIdentityPools/…/providers/…` |
+| `GCP_SERVICE_ACCOUNT` | Secret | `deployer@PROJECT_ID.iam.gserviceaccount.com` |
+| `GCP_PROJECT_ID` | Variable | El ID del proyecto |
+| `GEMINI_MODEL` | Variable (opcional) | Por omisión `gemini-2.5-flash` |
+
+Si falta alguno, el workflow falla en el primer paso indicando cuál, en vez de
+a medias durante el despliegue.
+
+### Después del primer despliegue
+
+El servicio se crea con `--no-allow-unauthenticated`, es decir **cerrado**. Para
+abrirlo al equipo, concede `roles/run.invoker` a las cuentas que corresponda (o
+a `allUsers` si aceptas exponerlo públicamente, lo cual no se recomienda para
+una herramienta de finanzas).
+
+Además, el inicio de sesión con Google **no funcionará** hasta que añadas el
+dominio de la URL de Cloud Run a los dominios autorizados de Firebase Auth y a
+los orígenes de JavaScript del cliente OAuth. Ten en cuenta que los scopes de
+Gmail (`gmail.readonly`, `gmail.compose`) son restringidos por Google: para
+usarlos sin pasar por el proceso de verificación, añade a los usuarios del
+equipo como *test users* en la pantalla de consentimiento de OAuth.
+
 ## Integración continua
 
 `.github/workflows/ci.yml` corre en cada push a `main` y en cada pull request:
