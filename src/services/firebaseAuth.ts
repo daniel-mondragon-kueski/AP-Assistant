@@ -84,6 +84,26 @@ export const getAccessToken = async (): Promise<string | null> => {
   return getCachedToken();
 };
 
+/**
+ * The signed-in user's Firebase ID token, sent to our own /api endpoints so
+ * the server can verify who is calling and check them against ALLOWED_USERS.
+ *
+ * Distinct from the Gmail access token: that one goes to Google's APIs, this
+ * one proves identity to this app's backend. Returns null when nobody is
+ * signed in, so callers can surface "inicia sesión" instead of a 401.
+ */
+export const getIdToken = async (): Promise<string | null> => {
+  const user = auth.currentUser;
+  if (!user) return null;
+  try {
+    // Refreshes automatically when the cached token is close to expiring.
+    return await user.getIdToken();
+  } catch (error) {
+    console.error('No se pudo obtener el ID token de Firebase:', error);
+    return null;
+  }
+};
+
 export const setAccessTokenInMemory = (token: string | null) => {
   setCachedToken(token);
 };

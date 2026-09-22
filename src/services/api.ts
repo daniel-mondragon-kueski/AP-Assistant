@@ -5,6 +5,7 @@
 // same as "the body has the shape we expect".
 import type { z } from 'zod';
 
+import { getIdToken } from './firebaseAuth';
 import {
   analyzeEmailsResponseSchema,
   auditChatResponseSchema,
@@ -76,6 +77,19 @@ async function parseResponse<T>(
   return result.data;
 }
 
+/**
+ * Headers for an /api call, including the caller's identity.
+ *
+ * The server checks the ID token against its allowlist, so a request without
+ * one is answered with 401 rather than silently working.
+ */
+async function apiHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const idToken = await getIdToken();
+  if (idToken) headers.Authorization = `Bearer ${idToken}`;
+  return headers;
+}
+
 export async function fetchBackendHealth(): Promise<BackendHealth | null> {
   try {
     const res = await fetch('/api/health');
@@ -90,7 +104,7 @@ export async function fetchBackendHealth(): Promise<BackendHealth | null> {
 export async function postAnalyzeEmails(payload: unknown): Promise<AnalyzeEmailsResponse> {
   const res = await fetch('/api/analyze-emails', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await apiHeaders(),
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
@@ -102,7 +116,7 @@ export async function postAnalyzeEmails(payload: unknown): Promise<AnalyzeEmails
 export async function postGenerateDraft(payload: unknown) {
   const res = await fetch('/api/generate-draft-content', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await apiHeaders(),
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
@@ -114,7 +128,7 @@ export async function postGenerateDraft(payload: unknown) {
 export async function postAuditChat(payload: unknown) {
   const res = await fetch('/api/audit-chat', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await apiHeaders(),
     body: JSON.stringify(payload),
   });
   if (!res.ok) {

@@ -4,12 +4,16 @@ import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import { ZodError, type ZodType } from "zod";
 
+import { createRemoteJWKSet, jwtVerify } from "jose";
+
 import {
   analyzeEmailsRequestSchema,
   auditChatRequestSchema,
   generateDraftRequestSchema,
 } from "./src/schemas/api";
 import { validateGeminiOrders } from "./src/schemas/orders";
+import { allowListMode, isEmailAllowed, parseAllowList } from "./src/schemas/access";
+import firebaseConfig from "./firebase-applet-config.json";
 
 // Load .env.local first (local overrides, git-ignored) then .env.
 dotenv.config({ path: ".env.local" });
@@ -22,6 +26,90 @@ const PORT = Number(process.env.PORT) || 3000;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
 app.use(express.json({ limit: "15mb" }));
+
+// ---------------------------------------------------------------------------
+// Access control for the AI endpoints.
+//
+// Cloud Run runs with public ingress because an authenticated service rejects
+// a plain browser request (no bearer token is attached), so the page could not
+// load at all. The restriction is enforced here instead: every /api call
+// carries the caller's Firebase ID token, which is verified against Google's
+// public keys and its email checked against ALLOWED_USERS.
+// ---------------------------------------------------------------------------
+
+const ALLOW_RULES = parseAllowList(process.env.ALLOWED_USERS);
+const ACCESS_MODE = allowListMode(ALLOW_RULES, process.env.NODE_ENV);
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || firebaseConfig.projectId;
+
+// Google's public keys for Firebase ID tokens. jose caches and refreshes these.
+const FIREBASE_JWKS = createRemoteJWKSet(
+  new URL("https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com")
+);
+
+/** Verifies a Firebase ID token and returns its verified email. */
+async function verifyIdToken(token: string): Promise<string | undefined> {
+  const { payload } = await jwtVerify(token, FIREBASE_JWKS, {
+    issuer: `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`,
+    audience: FIREBASE_PROJECT_ID,
+    algorithms: ["RS256"],
+  });
+
+  // jose checks the signature, issuer, audience and expiry. Firebase also
+  // requires a non-empty subject, and an unverified email is not an identity.
+  if (!payload.sub) return undefined;
+  if (payload.email_verified !== true) return undefined;
+  return typeof payload.email === "string" ? payload.email : undefined;
+}
+
+async function requireAllowedUser(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  if (ACCESS_MODE === "open_dev") return next();
+
+  if (ACCESS_MODE === "deny_all") {
+    // Fails closed: a production deploy without ALLOWED_USERS must not expose
+    // the tool, so this is a configuration error rather than an open door.
+    return res.status(503).json({
+      error:
+        "El servicio no tiene lista de acceso configurada. Define ALLOWED_USERS con los correos autorizados y vuelve a desplegar.",
+      code: "ACCESS_NOT_CONFIGURED",
+    });
+  }
+
+  const header = req.get("authorization") || "";
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  if (!match) {
+    return res.status(401).json({
+      error: "Inicia sesión con tu cuenta de Google para usar el asistente.",
+      code: "AUTH_REQUIRED",
+    });
+  }
+
+  let email: string | undefined;
+  try {
+    email = await verifyIdToken(match[1]);
+  } catch {
+    return res.status(401).json({
+      error: "Tu sesión de Google expiró o no es válida. Vuelve a iniciar sesión.",
+      code: "AUTH_INVALID",
+    });
+  }
+
+  if (!isEmailAllowed(email, ALLOW_RULES)) {
+    // Worth logging for whoever administers the allowlist: it is the only
+    // signal that someone with a Google account tried and was turned away.
+    console.warn(`Acceso denegado para ${email || "(sin correo en el token)"}.`);
+    return res.status(403).json({
+      error:
+        "Tu cuenta no está autorizada para usar este asistente. Solicita acceso al responsable de Cuentas por Pagar.",
+      code: "ACCESS_DENIED",
+    });
+  }
+
+  return next();
+}
 
 function getApiKey(): string | undefined {
   return process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.API_KEY;
@@ -82,7 +170,7 @@ app.get("/api/health", (_req, res) => {
 });
 
 // 1. Analyze batch of emails with Gemini for PO, Template Match & Secondary Filtering
-app.post("/api/analyze-emails", async (req, res) => {
+app.post("/api/analyze-emails", requireAllowedUser, async (req, res) => {
   try {
     const { emails, templates, filterOptions } = parseBody(
       analyzeEmailsRequestSchema,
@@ -346,7 +434,7 @@ Extrae rigurosamente para cada correo que califique en el radar:
 });
 
 // 2. Draft generator assistant / customizer
-app.post("/api/generate-draft-content", async (req, res) => {
+app.post("/api/generate-draft-content", requireAllowedUser, async (req, res) => {
   try {
     const { type, orderNumber, supplierName, amount, currency, dueDate, bankDetails, reason, notes } =
       parseBody(generateDraftRequestSchema, req.body);
@@ -394,7 +482,7 @@ Devuelve un JSON con:
 });
 
 // 3. Interactive AP & Proposal Audit Chat Assistant
-app.post("/api/audit-chat", async (req, res) => {
+app.post("/api/audit-chat", requireAllowedUser, async (req, res) => {
   try {
     const { messages, radarOrders, analysisResult } = parseBody(
       auditChatRequestSchema,
@@ -525,6 +613,17 @@ async function setupViteOrStatic() {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
     console.log(`Gemini model: ${GEMINI_MODEL}`);
+    if (ACCESS_MODE === "enforce") {
+      console.log(`Acceso restringido a ${ALLOW_RULES.length} regla(s) de ALLOWED_USERS.`);
+    } else if (ACCESS_MODE === "deny_all") {
+      console.error(
+        "[error] ALLOWED_USERS no está definida en producción: los endpoints de IA responderán 503 hasta configurarla."
+      );
+    } else {
+      console.warn(
+        "[aviso] Sin ALLOWED_USERS fuera de producción: los endpoints de IA quedan abiertos (solo para desarrollo local)."
+      );
+    }
     if (!getApiKey()) {
       console.warn(
         "[aviso] GEMINI_API_KEY no está configurada. La UI y el radar cargan, pero los endpoints de IA responderán 503 hasta que la definas en .env.local."

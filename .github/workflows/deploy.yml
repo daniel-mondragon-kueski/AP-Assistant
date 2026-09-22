@@ -33,7 +33,7 @@ jobs:
 
     env:
       SERVICE: ${{ inputs.service || 'ap-assistant' }}
-      REGION: ${{ inputs.region || 'us-central1' }}
+      REGION: ${{ inputs.region || vars.GCP_REGION || 'us-central1' }}
       REPOSITORY: ap-assistant
 
     steps:
@@ -45,6 +45,10 @@ jobs:
           [ -n "${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}" ] || missing+=("secret GCP_WORKLOAD_IDENTITY_PROVIDER")
           [ -n "${{ secrets.GCP_SERVICE_ACCOUNT }}" ] || missing+=("secret GCP_SERVICE_ACCOUNT")
           [ -n "${{ vars.GCP_PROJECT_ID }}" ] || missing+=("variable GCP_PROJECT_ID")
+          [ -n "${{ vars.CLOUD_RUN_SA }}" ] || missing+=("variable CLOUD_RUN_SA")
+          # Without an allowlist the service deploys but denies every request,
+          # so it is better caught here than discovered by a confused user.
+          [ -n "${{ vars.ALLOWED_USERS }}" ] || missing+=("variable ALLOWED_USERS (correos autorizados, separados por coma)")
 
           if [ ${#missing[@]} -gt 0 ]; then
             echo "Faltan datos de configuración para desplegar:" >&2
@@ -88,19 +92,31 @@ jobs:
           # GEMINI_API_KEY comes from Secret Manager, never from a plain env
           # var or the image, so the key is not readable in the Cloud Run
           # console or in the build logs.
+          #
+          # --allow-unauthenticated is required, not a relaxation: an
+          # authenticated Cloud Run service rejects a plain browser request
+          # (no bearer token is attached), so the page could not load at all.
+          # Access is restricted inside the app instead — every /api call must
+          # carry a Firebase ID token whose email is in ALLOWED_USERS, and the
+          # server denies everything if that list is unset in production.
+          #
+          # --set-env-vars uses commas as its own separator, and ALLOWED_USERS
+          # is itself a comma-separated list, so the ^##^ form picks a
+          # delimiter that cannot appear in an email address or a model id.
           gcloud run deploy "${SERVICE}" \
             --image "${IMAGE}" \
             --project "${{ vars.GCP_PROJECT_ID }}" \
             --region "${REGION}" \
             --platform managed \
             --port 8080 \
+            --service-account "${{ vars.CLOUD_RUN_SA }}" \
             --set-secrets "GEMINI_API_KEY=gemini-api-key:latest" \
-            --set-env-vars "GEMINI_MODEL=${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}" \
+            --set-env-vars "^##^GEMINI_MODEL=${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}##ALLOWED_USERS=${{ vars.ALLOWED_USERS }}" \
             --memory 512Mi \
             --cpu 1 \
             --min-instances 0 \
             --max-instances 4 \
-            --no-allow-unauthenticated \
+            --allow-unauthenticated \
             --quiet
 
       - name: Report the service URL
@@ -117,6 +133,8 @@ jobs:
             echo "- **Servicio:** \`${SERVICE}\` (${REGION})"
             echo "- **URL:** ${url}"
             echo "- **Commit:** \`${GITHUB_SHA}\`"
+            echo ""
+            echo "**Acceso restringido a:** \`${{ vars.ALLOWED_USERS }}\`"
             echo ""
             echo "Recuerda añadir el dominio de esa URL a los dominios autorizados"
             echo "de Firebase Auth y a los orígenes de JavaScript del cliente OAuth,"
